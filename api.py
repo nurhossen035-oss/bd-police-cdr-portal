@@ -284,7 +284,7 @@ HTML_TEMPLATE = """
                                 <th style="width: 15%;">মোবাইল নম্বর</th>
                                 <th style="width: 15%;">তারিখ ও সময়</th>
                                 <th style="width: 12%;">কথা বলার সময়</th>
-                                <th style="width: 43%;">লোকেশন / টাওয়ার ঠিকানা (LAC & Cell ID)</th>
+                                <th style="width: 43%;">লোকেশন / ঠিকানা (ADDRESS)</th>
                                 <th style="width: 15%;">গুগল ম্যাপ</th>
                             </tr>
                         </thead>
@@ -303,7 +303,7 @@ HTML_TEMPLATE = """
                                 <th style="width: 15%; background-color: #991b1b !important; color:#fff !important;">মোবাইল নম্বর</th>
                                 <th style="width: 15%; background-color: #991b1b !important; color:#fff !important;">তারিখ ও সময়</th>
                                 <th style="width: 12%; background-color: #991b1b !important; color:#fff !important;">কথা বলার সময়</th>
-                                <th style="width: 43%; background-color: #991b1b !important; color:#fff !important;">লোকেশন / টাওয়ার ঠিকানা (LAC & Cell ID)</th>
+                                <th style="width: 43%; background-color: #991b1b !important; color:#fff !important;">লোকেশন / ঠিকানা (ADDRESS)</th>
                                 <th style="width: 15%; background-color: #991b1b !important; color:#fff !important;">গুগল ম্যাপ</th>
                             </tr>
                         </thead>
@@ -556,13 +556,17 @@ async def analyze_cdr(file: UploadFile = File(...), session: str = Cookie(defaul
         df.columns = [str(col).strip() for col in df.columns]
 
         def find_column(keywords):
+            # প্রথমে হুবহু মিল খোঁজা (যেমন: ADDRESS)
+            for col in df.columns:
+                if str(col).strip().lower() in keywords:
+                    return col
+            # এরপর আংশিক মিল খোঁজা
             for col in df.columns:
                 c_clean = str(col).lower().replace(" ", "_").replace("-", "_").replace(".", "_")
                 if any(k in c_clean for k in keywords):
                     return col
             return None
 
-        # সকল অপারেটরের (GP, Robi, Banglalink, Teletalk ইত্যাদি) বিভিন্ন ভ্যারিয়েশন কলামের জন্য সুসংহত ম্যাপ
         date_col = find_column(['call_date', 'date', 'start_date', 'call_date_time', 'event_date', 'transaction_date', 'calling_date', 'start_date_time'])
         time_col = find_column(['call_time', 'time', 'start_time', 'call_start_time', 'event_time', 'calling_time'])
         dt_col = find_column(['start_dttime', 'dttime', 'datetime', 'time_stamp', 'timestamp', 'date_time', 'call_datetime', 'event_timestamp'])
@@ -573,6 +577,7 @@ async def analyze_cdr(file: UploadFile = File(...), session: str = Cookie(defaul
         imsi_col = find_column(['imsi', 'imsia', 'calling_imsi', 'called_imsi'])
         imei_col = find_column(['imei', 'imeia', 'calling_imei', 'called_imei'])
         
+        # ADDRESS কলামকে সর্বোচ্চ অগ্রাধিকার দেওয়া হয়েছে
         address_col = find_column(['address', 'site_address', 'tower_address', 'site_name', 'cell_name', 'location', 'site_description', 'location_description'])
         latlong_col = find_column(['lat_long', 'latlong', 'gps', 'coord', 'location_coord', 'latitude_longitude'])
         lat_col = find_column(['latitude', 'lat'])
@@ -609,65 +614,38 @@ async def analyze_cdr(file: UploadFile = File(...), session: str = Cookie(defaul
         else:
             df['Duration_Sec'] = 0
 
-        def extract_coords(row):
-            if latlong_col and latlong_col in df.columns and pd.notna(row[latlong_col]):
-                val = str(row[latlong_col])
-                match = re.search(r'(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)', val)
-                if match:
-                    return float(match.group(1)), float(match.group(2))
-            if lat_col and lon_col and lat_col in df.columns and lon_col in df.columns and pd.notna(row[lat_col]) and pd.notna(row[lon_col]):
-                try:
-                    return float(row[lat_col]), float(row[lon_col])
-                except:
-                    pass
-            return None, None
-
-        coords_list = [extract_coords(row) for _, row in df.iterrows()]
-        df['Lat'] = [c[0] for c in coords_list]
-        df['Lon'] = [c[1] for c in coords_list]
-
-        df['LAC'] = df[lac_col].astype(str).str.replace(r'\.0$', '', regex=True) if lac_col and lac_col in df.columns else ''
-        df['Cell_ID'] = df[ci_col].astype(str).str.replace(r'\.0$', '', regex=True) if ci_col and ci_col in df.columns else ''
-        df['Address_Text'] = df[address_col].astype(str).replace(['nan', 'None', 'NAT', '0', '', 'N/A', 'NaN'], '') if address_col and address_col in df.columns else ''
+        df['Address_Text'] = df[address_col].astype(str).str.strip() if address_col and address_col in df.columns else ''
 
         def build_location_info(row):
             addr = str(row['Address_Text']).strip() if 'Address_Text' in row and pd.notna(row['Address_Text']) else ''
-            lac = str(row['LAC']).strip() if 'LAC' in row and pd.notna(row['LAC']) else ''
-            cid = str(row['Cell_ID']).strip() if 'Cell_ID' in row and pd.notna(row['Cell_ID']) else ''
-            lat, lon = row.get('Lat'), row.get('Lon')
+            invalid_vals = {'nan', 'none', 'null', 'nat', '0', 'n/a', '', 'nan'}
             
-            info_parts = []
-            if addr and addr.lower() not in ['nan', 'none', 'null', 'nat', '0', 'n/a', '']:
-                info_parts.append(addr)
-            if lat is not None and lon is not None:
-                info_parts.append(f"[GPS: {lat}, {lon}]")
-            if lac and lac.lower() not in ['nan', 'none', 'null', '0', 'n/a', ''] and cid and cid.lower() not in ['nan', 'none', 'null', '0', 'n/a', '']:
-                info_parts.append(f"(LAC: {lac}, Cell ID: {cid})")
-            elif lac and lac.lower() not in ['nan', 'none', 'null', '0', 'n/a', '']:
-                info_parts.append(f"(LAC: {lac})")
+            # ADDRESS কলামের তথ্য থাকলে সেটিই প্রধান লোকেশন হিসেবে দেখাবে
+            if addr and addr.lower() not in invalid_vals:
+                return addr
             
-            return " ".join([str(p) for p in info_parts]) if info_parts else "অজানা লোকেশন"
+            # ADDRESS না থাকলে বিকল্প হিসেবে LAC বা Cell ID দেখাবে
+            lac = str(row[lac_col]).strip() if lac_col and lac_col in df.columns and pd.notna(row[lac_col]) else ''
+            cid = str(row[ci_col]).strip() if ci_col and ci_col in df.columns and pd.notna(row[ci_col]) else ''
+            
+            if lac and lac.lower() not in invalid_vals and cid and cid.lower() not in invalid_vals:
+                return f"LAC: {lac}, Cell ID: {cid}"
+            elif lac and lac.lower() not in invalid_vals:
+                return f"LAC: {lac}"
+            
+            return "অজানা লোকেশন"
 
         def build_map_url(row):
-            lat, lon = row.get('Lat'), row.get('Lon')
             addr = str(row.get('Address_Text', '')).strip()
-
-            try:
-                lat_num, lon_num = float(lat), float(lon)
-                if (pd.notna(lat_num) and pd.notna(lon_num)
-                        and -90 <= lat_num <= 90 and -180 <= lon_num <= 180):
-                    return f"https://www.google.com/maps/search/?api=1&query={lat_num:.6f}%2C{lon_num:.6f}"
-            except (TypeError, ValueError):
-                pass
-
-            invalid_addr = {'nan', 'none', 'null', 'nat', '0', 'n/a', ''}
-            if addr and len(addr) > 3 and addr.lower() not in invalid_addr:
+            invalid_vals = {'nan', 'none', 'null', 'nat', '0', 'n/a', '', 'nan'}
+            
+            if addr and len(addr) > 2 and addr.lower() not in invalid_vals:
                 query_text = addr
                 if 'bangladesh' not in query_text.lower():
                     query_text += ', Bangladesh'
                 query = urllib.parse.quote(query_text, safe='')
                 return f"https://www.google.com/maps/search/?api=1&query={query}"
-
+            
             return ""
 
         df['Location'] = df.apply(build_location_info, axis=1)
@@ -682,7 +660,6 @@ async def analyze_cdr(file: UploadFile = File(...), session: str = Cookie(defaul
 
         df['Duration_Formatted'] = df['Duration_Sec'].apply(format_duration)
 
-        # উন্নত ও নিখুঁত ডেট ও টাইম পার্সিং লজিক (সকল অপারেটরের জন্য)
         df['Full_DateTime'] = pd.NaT
         if dt_col and dt_col in df.columns:
             dt_series = df[dt_col].astype(str).str.replace(r'\.0$', '', regex=True)
@@ -705,7 +682,6 @@ async def analyze_cdr(file: UploadFile = File(...), session: str = Cookie(defaul
                 except:
                     continue
 
-        # সিডিআরের মূল তারিখ এবং সময় সঠিকভাবে সেট করার ব্যাকআপ ফলব্যাক
         raw_dates = df[date_col].astype(str).str.replace(r'\.0$', '', regex=True) if date_col and date_col in df.columns else pd.Series(['N/A']*len(df))
         raw_times = df[time_col].astype(str).str.replace(r'\.0$', '', regex=True) if time_col and time_col in df.columns else pd.Series(['N/A']*len(df))
 
