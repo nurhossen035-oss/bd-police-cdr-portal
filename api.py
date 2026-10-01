@@ -184,7 +184,7 @@ HTML_TEMPLATE = """
                     <i class="fa-solid fa-cloud-arrow-up fa-3x" style="color: #4f46e5;"></i>
                 </div>
                 <h5 class="fw-bold text-dark mb-1">CDR এক্সেল / সিএসভি ফাইল আপলোড করুন</h5>
-                <p class="text-muted small mb-3">ক্লিক করে আপনার ফরেনসিক CDR ফাইল (.xlsx / .csv) নির্বাচন করুন</p>
+                <p class="text-muted small mb-3">ক্লিক করে আপনার ফরেনসিক CDR ফাইল (.xlsx / .xls / .csv) নির্বাচন করুন</p>
                 <input type="file" id="fileInput" accept=".xlsx, .xls, .csv" style="display:none;" onchange="uploadFile()">
                 <button class="btn btn-primary px-4 rounded-pill fw-bold shadow-sm"><i class="fa-solid fa-upload me-1"></i> ফাইল সিলেক্ট করুন</button>
             </div>
@@ -545,22 +545,35 @@ async def analyze_cdr(file: UploadFile = File(...), session: str = Cookie(defaul
         contents = await file.read()
         filename = file.filename.lower()
         
-        if filename.endswith('.csv'):
-            df = pd.read_csv(io.BytesIO(contents), encoding='utf-8', errors='ignore')
-        else:
+        df = None
+        # বিভিন্ন পদ্ধতিতে ফাইল রিড করার চেষ্টা যাতে সব ফাইল আপলোড নেয়
+        for skiprows in [0, 1, 2, 3, 4, 5]:
             try:
-                df = pd.read_excel(io.BytesIO(contents))
+                if filename.endswith('.csv'):
+                    temp_df = pd.read_csv(io.BytesIO(contents), encoding='utf-8', errors='ignore', skiprows=skiprows)
+                else:
+                    temp_df = pd.read_excel(io.BytesIO(contents), skiprows=skiprows)
+                
+                temp_df.columns = [str(col).strip() for col in temp_df.columns]
+                # যদি কলামগুলোতে প্রয়োজনীয় কিওয়ার্ড পাওয়া যায় তবে এটি সঠিক হেডার রো
+                cols_str = " ".join([str(c).lower() for c in temp_df.columns])
+                if any(k in cols_str for k in ['date', 'time', 'bparty', 'b_party', 'called', 'duration', 'address', 'imsi', 'imei', 'number', 'msisdn']):
+                    df = temp_df
+                    break
             except:
-                df = pd.read_csv(io.BytesIO(contents), encoding='utf-8', errors='ignore')
+                continue
         
-        df.columns = [str(col).strip() for col in df.columns]
+        if df is None or df.empty:
+            if filename.endswith('.csv'):
+                df = pd.read_csv(io.BytesIO(contents), encoding='utf-8', errors='ignore')
+            else:
+                df = pd.read_excel(io.BytesIO(contents))
+            df.columns = [str(col).strip() for col in df.columns]
 
         def find_column(keywords):
-            # প্রথমে হুবহু মিল খোঁজা (যেমন: ADDRESS)
             for col in df.columns:
                 if str(col).strip().lower() in keywords:
                     return col
-            # এরপর আংশিক মিল খোঁজা
             for col in df.columns:
                 c_clean = str(col).lower().replace(" ", "_").replace("-", "_").replace(".", "_")
                 if any(k in c_clean for k in keywords):
@@ -577,11 +590,7 @@ async def analyze_cdr(file: UploadFile = File(...), session: str = Cookie(defaul
         imsi_col = find_column(['imsi', 'imsia', 'calling_imsi', 'called_imsi'])
         imei_col = find_column(['imei', 'imeia', 'calling_imei', 'called_imei'])
         
-        # ADDRESS কলামকে সর্বোচ্চ অগ্রাধিকার দেওয়া হয়েছে
         address_col = find_column(['address', 'site_address', 'tower_address', 'site_name', 'cell_name', 'location', 'site_description', 'location_description'])
-        latlong_col = find_column(['lat_long', 'latlong', 'gps', 'coord', 'location_coord', 'latitude_longitude'])
-        lat_col = find_column(['latitude', 'lat'])
-        lon_col = find_column(['longitude', 'long', 'lng'])
         lac_col = find_column(['lacstarta', 'lac', 'first_lac', 'last_lac', 'lac_start', 'location_area_code', 'start_lac', 'orig_lac'])
         ci_col = find_column(['cistarta', 'ci', 'cell_id', 'cellid', 'first_ci', 'last_ci', 'cell', 'cgi', 'cell_identity', 'start_ci', 'orig_ci'])
 
@@ -620,11 +629,9 @@ async def analyze_cdr(file: UploadFile = File(...), session: str = Cookie(defaul
             addr = str(row['Address_Text']).strip() if 'Address_Text' in row and pd.notna(row['Address_Text']) else ''
             invalid_vals = {'nan', 'none', 'null', 'nat', '0', 'n/a', '', 'nan'}
             
-            # ADDRESS কলামের তথ্য থাকলে সেটিই প্রধান লোকেশন হিসেবে দেখাবে
             if addr and addr.lower() not in invalid_vals:
                 return addr
             
-            # ADDRESS না থাকলে বিকল্প হিসেবে LAC বা Cell ID দেখাবে
             lac = str(row[lac_col]).strip() if lac_col and lac_col in df.columns and pd.notna(row[lac_col]) else ''
             cid = str(row[ci_col]).strip() if ci_col and ci_col in df.columns and pd.notna(row[ci_col]) else ''
             
@@ -660,23 +667,33 @@ async def analyze_cdr(file: UploadFile = File(...), session: str = Cookie(defaul
 
         df['Duration_Formatted'] = df['Duration_Sec'].apply(format_duration)
 
+        # নিখুঁত তারিখ ও সময় পার্সিং (Fixing 1970-01-01 issue)
         df['Full_DateTime'] = pd.NaT
+        
         if dt_col and dt_col in df.columns:
-            dt_series = df[dt_col].astype(str).str.replace(r'\.0$', '', regex=True)
-            df['Full_DateTime'] = pd.to_datetime(dt_series, errors='coerce', dayfirst=True)
-        elif date_col and date_col in df.columns:
-            date_series = df[date_col].astype(str).str.replace(r'\.0$', '', regex=True)
-            if time_col and time_col in df.columns:
-                time_series = df[time_col].astype(str).str.replace(r'\.0$', '', regex=True)
-                df['Full_DateTime'] = pd.to_datetime(date_series + ' ' + time_series, errors='coerce', dayfirst=True)
+            if pd.api.types.is_numeric_dtype(df[dt_col]):
+                df['Full_DateTime'] = pd.to_datetime(df[dt_col], unit='d', origin='1899-12-30', errors='coerce')
             else:
-                df['Full_DateTime'] = pd.to_datetime(date_series, errors='coerce', dayfirst=True)
+                dt_series = df[dt_col].astype(str).str.replace(r'\.0$', '', regex=True)
+                df['Full_DateTime'] = pd.to_datetime(dt_series, errors='coerce', dayfirst=True, format='mixed')
+        
+        if df['Full_DateTime'].isna().all() and date_col and date_col in df.columns:
+            if pd.api.types.is_numeric_dtype(df[date_col]):
+                df['Full_DateTime'] = pd.to_datetime(df[date_col], unit='d', origin='1899-12-30', errors='coerce')
+            else:
+                date_series = df[date_col].astype(str).str.replace(r'\.0$', '', regex=True)
+                if time_col and time_col in df.columns:
+                    time_series = df[time_col].astype(str).str.replace(r'\.0$', '', regex=True)
+                    combined = date_series + ' ' + time_series
+                    df['Full_DateTime'] = pd.to_datetime(combined, errors='coerce', dayfirst=True, format='mixed')
+                else:
+                    df['Full_DateTime'] = pd.to_datetime(date_series, errors='coerce', dayfirst=True, format='mixed')
 
         if df['Full_DateTime'].isna().all():
             for col in df.columns:
                 try:
-                    parsed = pd.to_datetime(df[col], errors='coerce', dayfirst=True)
-                    if parsed.notna().sum() > len(df) * 0.4:
+                    parsed = pd.to_datetime(df[col], errors='coerce', dayfirst=True, format='mixed')
+                    if parsed.notna().sum() > len(df) * 0.3:
                         df['Full_DateTime'] = parsed
                         break
                 except:
