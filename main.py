@@ -1,37 +1,104 @@
+import os
 import pandas as pd
+from flask import Flask, request, jsonify, render_template
 
-def process_cdr_dates(df, dt_col=None, date_col=None, time_col=None):
-    # প্রথমে ডেট কলামের ফাঁকা বা জিরো ভ্যালুগুলোকে পরিষ্কার করা
-    if dt_col and dt_col in df.columns:
-        # যদি নিউমেরিক বা এক্সেল সিরিয়াল হয়
-        if pd.api.types.is_numeric_dtype(df[dt_col]):
-            # ০ বা নেগেটিভ মানগুলোকে NaT এ রূপান্তর করা
-            df.loc[df[dt_col] <= 0, dt_col] = pd.NA
-            df['Full_DateTime'] = pd.to_datetime(df[dt_col], unit='s', origin='1899-12-30', errors='coerce')
+app = Flask(__name__)
+
+def load_and_process_cdr(file_path):
+    """
+    বিভিন্ন অপারেটরের ভিন্ন ভিন্ন কলামের নাম ও ফরম্যাটের CDR ফাইল (CSV, XLSX, XLS) 
+    নিরাপদে রিড এবং সময়/তারিখ নিখুঁতভাবে প্রসেস করার ফাংশন।
+    """
+    file_ext = os.path.splitext(file_path)[1].lower()
+    df = None
+    
+    # ১. ফাইল ফরম্যাট অনুযায়ী নিরাপদে রিড করা
+    try:
+        if file_ext == '.csv':
+            for encoding in ['utf-8', 'latin1', 'cp1252']:
+                try:
+                    df = pd.read_csv(file_path, encoding=encoding, low_memory=False)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            if df is None:
+                df = pd.read_csv(file_path, encoding='latin1', low_memory=False)
+                
+        elif file_ext in ['.xlsx', '.xls']:
+            xls = pd.ExcelFile(file_path)
+            # প্রথম শিট বা যেখানে CDR ডাটা আছে তা লোড করা
+            sheet_name = xls.sheet_names[0]
+            df = pd.read_excel(file_path, sheet_name=sheet_name)
         else:
-            dt_series = df[dt_col].astype(str).str.replace(r'\.0$', '', regex=True)
-            dt_series = dt_series.replace(['0', '0.0', 'nan', 'NaT', 'None', ''], pd.NA)
-            df['Full_DateTime'] = pd.to_datetime(dt_series, errors='coerce', dayfirst=True, format='mixed')
+            raise ValueError("অসমর্থিত ফাইল ফরম্যাট! দয়া করে .csv, .xlsx অথবা .xls ফাইল আপلود করুন।")
+    except Exception as e:
+        raise Exception(f"ফাইল পড়তে সমস্যা হয়েছে: {str(e)}")
 
-    # যদি আলাদা ডেট এবং টাইম কলাম থাকে
-    elif date_col and date_col in df.columns:
-        date_series = df[date_col].astype(str).str.replace(r'\.0$', '', regex=True)
+    # কলামের নামগুলোর অতিরিক্ত স্পেস ট্রিম করা
+    df.columns = [str(col).strip() for col in df.columns]
+
+    # ২. ডাইনামিকভাবে ডেট/টাইম কলাম খুঁজে বের করা (গ্রামীণফোন, রবি, বাংলালিংক ইত্যাদির ভিন্ন নামের জন্য)
+    dt_candidates = ['START', 'START_DTTIME', 'START_TIME', 'Start', 'start_time', 'Start_DateTime']
+    date_candidates = ['DATE', 'CALL_DATE', 'Date', 'date']
+    time_candidates = ['TIME', 'CALL_TIME', 'Time', 'time']
+
+    found_dt_col = next((col for col in dt_candidates if col in df.columns), None)
+    found_date_col = next((col for col in date_candidates if col in df.columns), None)
+    found_time_col = next((col for col in time_candidates if col in df.columns), None)
+
+    # ৩. সময় ও তারিখ নিখুঁতভাবে পার্স করার লজিক (এলোমেলো হওয়া রোধ করতে)
+    df['Full_DateTime'] = pd.NaT
+
+    if found_dt_col:
+        # যদি একটিমাত্র কম্বাইন্ড ডেট-টাইম কলাম থাকে (যেমন: YYYYMMDDHHMMSS বা এক্সেল সিরিয়াল)
+        if pd.api.types.is_numeric_dtype(df[found_dt_col]):
+            df.loc[df[found_dt_col] <= 0, found_dt_col] = pd.NA
+            # এক্সেল সিরিয়াল ডেটের জন্য unit='D' ব্যবহার করা হয়েছে
+            df['Full_DateTime'] = pd.to_datetime(df[found_dt_col], unit='D', origin='1899-12-30', errors='coerce')
+        else:
+            dt_series = df[found_dt_col].astype(str).str.replace(r'\.0$', '', regex=True)
+            dt_series = dt_series.replace(['0', '0.0', 'nan', 'NaT', 'None', ''], pd.NA)
+            # dayfirst=False রেখে স্ট্যান্ডার্ড ফরম্যাট নিশ্চিত করা যাতে দিন ও মাস উল্টে না যায়
+            df['Full_DateTime'] = pd.to_datetime(dt_series, errors='coerce', format='mixed')
+
+    elif found_date_col:
+        # যদি আলাদা ডেট এবং টাইম কলাম থাকে
+        date_series = df[found_date_col].astype(str).str.replace(r'\.0$', '', regex=True)
         date_series = date_series.replace(['0', '0.0', 'nan', 'NaT', 'None', ''], pd.NA)
         
-        if time_col and time_col in df.columns:
-            time_series = df[time_col].astype(str).str.replace(r'\.0$', '', regex=True).fillna('00:00:00')
+        if found_time_col:
+            time_series = df[found_time_col].astype(str).str.replace(r'\.0$', '', regex=True).fillna('00:00:00')
             combined_series = date_series + ' ' + time_series
-            df['Full_DateTime'] = pd.to_datetime(combined_series, errors='coerce', dayfirst=True, format='mixed')
+            df['Full_DateTime'] = pd.to_datetime(combined_series, errors='coerce', format='mixed')
         else:
-            df['Full_DateTime'] = pd.to_datetime(date_series, errors='coerce', dayfirst=True, format='mixed')
+            df['Full_DateTime'] = pd.to_datetime(date_series, errors='coerce', format='mixed')
 
-    # সিডিআর ডেটা সর্বোচ্চ ২ বছরের (২০২৪ থেকে ২০২৬) মধ্যে সীমাবদ্ধ রাখার লজিক
-    # এর বাইরের কোনো পুরোনো তারিখ (যেমন ১৯৭০ বা ১৮৯৯) থাকলে তা স্বয়ংক্রিয়ভাবে মুছে (NaT) যাবে
+    # ৪. বছর ফিল্টারিং লজিক (২০২৪ থেকে ২০২৬ এর মধ্যে সীমাবদ্ধ রাখা)
     if 'Full_DateTime' in df.columns:
         df['Full_DateTime'] = pd.to_datetime(df['Full_DateTime'], errors='coerce')
-        
-        # বর্তমান বছর ২০২৬ হলে, ২০২৪ এর আগের বা ভবিষ্যতের তারিখগুলো ফিল্টার করা
         valid_mask = (df['Full_DateTime'].dt.year >= 2024) & (df['Full_DateTime'].dt.year <= 2026)
         df.loc[~valid_mask, 'Full_DateTime'] = pd.NaT
 
     return df
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    if 'file' not in request.files:
+        return jsonify({'error': 'কোনো ফাইল পাওয়া যায়নি'}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'ফাইল নির্বাচন করা হয়নি'}), 400
+        
+    file_path = os.path.join('/tmp', file.filename)
+    file.save(file_path)
+    
+    try:
+        processed_df = load_and_process_cdr(file_path)
+        # এখানে আপনার অন্যান্য এনালাইসিস বা প্রসেসিং কোড যুক্ত করতে পারেন
+        return jsonify({'success': True, 'message': 'ফাইল সফলভাবে প্রসেস হয়েছে!'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(debug=True)
