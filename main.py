@@ -5,14 +5,10 @@ from flask import Flask, request, jsonify, render_template
 app = Flask(__name__)
 
 def load_and_process_cdr(file_path):
-    """
-    বিভিন্ন অপারেটরের ভিন্ন ভিন্ন কলামের নাম ও ফরম্যাটের CDR ফাইল (CSV, XLSX, XLS) 
-    নিরাপদে রিড এবং সময়/তারিখ নিখুঁতভাবে প্রসেস করার ফাংশন।
-    """
     file_ext = os.path.splitext(file_path)[1].lower()
     df = None
     
-    # ১. ফাইল ফরম্যাট অনুযায়ী নিরাপদে রিড করা
+    # ১. ফাইল নিরাপদে রিড করা (কোনো অতিরিক্ত errors প্যারামিটার ছাড়া)
     try:
         if file_ext == '.csv':
             for encoding in ['utf-8', 'latin1', 'cp1252']:
@@ -26,19 +22,18 @@ def load_and_process_cdr(file_path):
                 
         elif file_ext in ['.xlsx', '.xls']:
             xls = pd.ExcelFile(file_path)
-            # প্রথম শিট বা যেখানে CDR ডাটা আছে তা লোড করা
-            sheet_name = xls.sheet_names[0]
-            df = pd.read_excel(file_path, sheet_name=sheet_name)
+            # প্রথম শিট রিড করা
+            df = pd.read_excel(file_path, sheet_name=xls.sheet_names[0])
         else:
-            raise ValueError("অসমর্থিত ফাইল ফরম্যাট! দয়া করে .csv, .xlsx অথবা .xls ফাইল আপلود করুন।")
+            raise ValueError("অসমর্থিত ফাইল ফরম্যাট!")
     except Exception as e:
         raise Exception(f"ফাইল পড়তে সমস্যা হয়েছে: {str(e)}")
 
-    # কলামের নামগুলোর অতিরিক্ত স্পেস ট্রিম করা
+    # কলামের নামগুলোর স্পেস ট্রিম করা
     df.columns = [str(col).strip() for col in df.columns]
 
-    # ২. ডাইনামিকভাবে ডেট/টাইম কলাম খুঁজে বের করা (গ্রামীণফোন, রবি, বাংলালিংক ইত্যাদির ভিন্ন নামের জন্য)
-    dt_candidates = ['START', 'START_DTTIME', 'START_TIME', 'Start', 'start_time', 'Start_DateTime']
+    # ২. সব অপারেটরের ভিন্ন ভিন্ন ডেট কলামের নামগুলোর লিস্ট
+    dt_candidates = ['START_DTTIME', 'START', 'START_TIME', 'Start', 'start_time', 'Start_DateTime', 'CALL_START_TIME']
     date_candidates = ['DATE', 'CALL_DATE', 'Date', 'date']
     time_candidates = ['TIME', 'CALL_TIME', 'Time', 'time']
 
@@ -46,23 +41,31 @@ def load_and_process_cdr(file_path):
     found_date_col = next((col for col in date_candidates if col in df.columns), None)
     found_time_col = next((col for col in time_candidates if col in df.columns), None)
 
-    # ৩. সময় ও তারিখ নিখুঁতভাবে পার্স করার লজিক (এলোমেলো হওয়া রোধ করতে)
     df['Full_DateTime'] = pd.NaT
 
+    # ৩. নিখুঁত ডেট ও টাইম পার্সিং (১৯৭০ এ যাওয়া রোধ করতে)
     if found_dt_col:
-        # যদি একটিমাত্র কম্বাইন্ড ডেট-টাইম কলাম থাকে (যেমন: YYYYMMDDHHMMSS বা এক্সেল সিরিয়াল)
-        if pd.api.types.is_numeric_dtype(df[found_dt_col]):
-            df.loc[df[found_dt_col] <= 0, found_dt_col] = pd.NA
-            # এক্সেল সিরিয়াল ডেটের জন্য unit='D' ব্যবহার করা হয়েছে
-            df['Full_DateTime'] = pd.to_datetime(df[found_dt_col], unit='D', origin='1899-12-30', errors='coerce')
+        raw_series = df[found_dt_col]
+        
+        # যদি সংখ্যা বা এক্সেল সিরিয়াল হয়
+        if pd.api.types.is_numeric_dtype(raw_series):
+            df.loc[raw_series <= 0, found_dt_col] = pd.NA
+            df['Full_DateTime'] = pd.to_datetime(raw_series, unit='D', origin='1899-12-30', errors='coerce')
         else:
-            dt_series = df[found_dt_col].astype(str).str.replace(r'\.0$', '', regex=True)
+            # স্ট্রিং ফরম্যাট (যেমন: YYYYMMDDHHMMSS বা সাধারণ ডেট স্ট্রিং) পরিষ্কার করা
+            dt_series = raw_series.astype(str).str.replace(r'\.0$', '', regex=True)
             dt_series = dt_series.replace(['0', '0.0', 'nan', 'NaT', 'None', ''], pd.NA)
-            # dayfirst=False রেখে স্ট্যান্ডার্ড ফরম্যাট নিশ্চিত করা যাতে দিন ও মাস উল্টে না যায়
-            df['Full_DateTime'] = pd.to_datetime(dt_series, errors='coerce', format='mixed')
+            
+            # গ্রামীণফোন বা অন্যান্য অপারেটরের ১৪ ডিজিটের স্ট্রিং (যেমন: 20260901204241) সরাসরি পার্স করার চেষ্টা
+            parsed_dates = pd.to_datetime(dt_series, format='%Y%m%d%H%M%S', errors='coerce')
+            
+            # যদি স্ট্যান্ডার্ড ফরম্যাটে কাজ না করে, তবে জেনারেল মিক্সড ফরম্যাট ট্রাই করা
+            if parsed_dates.isna().all():
+                parsed_dates = pd.to_datetime(dt_series, errors='coerce', dayfirst=True, format='mixed')
+                
+            df['Full_DateTime'] = parsed_dates
 
     elif found_date_col:
-        # যদি আলাদা ডেট এবং টাইম কলাম থাকে
         date_series = df[found_date_col].astype(str).str.replace(r'\.0$', '', regex=True)
         date_series = date_series.replace(['0', '0.0', 'nan', 'NaT', 'None', ''], pd.NA)
         
@@ -73,10 +76,13 @@ def load_and_process_cdr(file_path):
         else:
             df['Full_DateTime'] = pd.to_datetime(date_series, errors='coerce', format='mixed')
 
-    # ৪. বছর ফিল্টারিং লজিক (২০২৪ থেকে ২০২৬ এর মধ্যে সীমাবদ্ধ রাখা)
+    # ৪. সাল ফিল্টারিং (১৯৭০ বা অন্য কোনো ভুল সাল বাদ দিয়ে শুধু ২০২৪-২০২৬ রাখা)
     if 'Full_DateTime' in df.columns:
         df['Full_DateTime'] = pd.to_datetime(df['Full_DateTime'], errors='coerce')
+        # যেসব ডেটের সাল ২০২৪ থেকে ২০২৬ এর বাইরে (বা NaT), সেগুলোকে বাদ দেওয়া
         valid_mask = (df['Full_DateTime'].dt.year >= 2024) & (df['Full_DateTime'].dt.year <= 2026)
+        
+        # ভুল ডেটগুলোকে NaT করে দেওয়া যাতে ইন্টারফেসে ১৯৭০ না দেখায়
         df.loc[~valid_mask, 'Full_DateTime'] = pd.NaT
 
     return df
@@ -95,7 +101,6 @@ def upload_file():
     
     try:
         processed_df = load_and_process_cdr(file_path)
-        # এখানে আপনার অন্যান্য এনালাইসিস বা প্রসেসিং কোড যুক্ত করতে পারেন
         return jsonify({'success': True, 'message': 'ফাইল সফলভাবে প্রসেস হয়েছে!'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
