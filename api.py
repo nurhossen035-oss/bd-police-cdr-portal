@@ -697,13 +697,13 @@ async def analyze_cdr(file: UploadFile = File(...), session: str = Cookie(defaul
                 raw = str(value).strip()
                 if raw.lower() in ('', 'nan', 'nat', 'none', 'null'):
                     return pd.NaT
-                raw = re.sub(r'\\.0$', '', raw)
+                raw = re.sub(r'\.0$', '', raw)
 
-                if re.fullmatch(r'\\d{14}', raw):
+                if re.fullmatch(r'\d{14}', raw):
                     dt = pd.to_datetime(raw, format='%Y%m%d%H%M%S', errors='coerce')
-                elif re.fullmatch(r'\\d{8}', raw):
+                elif re.fullmatch(r'\d{8}', raw):
                     dt = pd.to_datetime(raw, format='%Y%m%d', errors='coerce')
-                elif re.fullmatch(r'\\d{4,6}(?:\\.\\d+)?', raw):
+                elif re.fullmatch(r'\d{4,6}(?:\.\d+)?', raw):
                     # Excel serial date কেবল স্বাভাবিক serial range-এ
                     try:
                         serial = float(raw)
