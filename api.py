@@ -550,7 +550,7 @@ async def analyze_cdr(file: UploadFile = File(...), session: str = Cookie(defaul
         for skiprows in [0, 1, 2, 3, 4, 5]:
             try:
                 if filename.endswith('.csv'):
-                    temp_df = pd.read_csv(io.BytesIO(contents), encoding='utf-8', errors='ignore', skiprows=skiprows)
+                    temp_df = pd.read_csv(io.BytesIO(contents), encoding='utf-8-sig', skiprows=skiprows)
                 else:
                     temp_df = pd.read_excel(io.BytesIO(contents), skiprows=skiprows)
                 
@@ -565,24 +565,41 @@ async def analyze_cdr(file: UploadFile = File(...), session: str = Cookie(defaul
         
         if df is None or df.empty:
             if filename.endswith('.csv'):
-                df = pd.read_csv(io.BytesIO(contents), encoding='utf-8', errors='ignore')
+                df = pd.read_csv(io.BytesIO(contents), encoding='utf-8-sig')
             else:
                 df = pd.read_excel(io.BytesIO(contents))
             df.columns = [str(col).strip() for col in df.columns]
 
+        def normalize_col(value):
+            # CSV-এর UTF-8 BOM এবং underscore/space/case পার্থক্য সরানো
+            return re.sub(r"[^a-z0-9]", "", str(value).replace("\ufeff", "").strip().lower())
+
         def find_column(keywords):
+            keys = [normalize_col(k) for k in keywords]
+            # আগে exact match, পরে contains match
             for col in df.columns:
-                if str(col).strip().lower() in keywords:
+                if normalize_col(col) in keys:
                     return col
             for col in df.columns:
-                c_clean = str(col).lower().replace(" ", "_").replace("-", "_").replace(".", "_")
-                if any(k in c_clean for k in keywords):
+                c_clean = normalize_col(col)
+                if any(k and k in c_clean for k in keys):
                     return col
             return None
 
-        date_col = find_column(['call_date', 'date', 'start_date', 'call_date_time', 'event_date', 'transaction_date', 'calling_date', 'start_date_time'])
-        time_col = find_column(['call_time', 'time', 'start_time', 'call_start_time', 'event_time', 'calling_time'])
-        dt_col = find_column(['start_dttime', 'dttime', 'datetime', 'time_stamp', 'timestamp', 'date_time', 'call_datetime', 'event_timestamp'])
+        # START, START_DTTIME এবং START_TIME—তিনটিই পূর্ণ date-time কলাম হতে পারে
+        dt_col = find_column([
+            'start_dttime', 'start', 'start_time', 'call_start_time',
+            'datetime', 'dttime', 'timestamp', 'time_stamp',
+            'date_time', 'call_datetime', 'event_timestamp',
+            'call_date_time', 'start_date_time'
+        ])
+        date_col = find_column([
+            'call_date', 'date', 'start_date', 'event_date',
+            'transaction_date', 'calling_date'
+        ])
+        time_col = find_column([
+            'call_time', 'time_only', 'event_time', 'calling_time'
+        ])
         b_party_col = find_column(['bparty', 'b_party', 'called', 'dialed', 'other_party', 'destination', 'number', 'msisdn', 'to', 'target', 'called_number', 'calling_number', 'other_party_number', 'called_party'])
         dur_col = find_column(['call_duration', 'duration', 'dur', 'sec', 'bill', 'talktime', 'callduration', 'call_dur', 'holding_time'])
         type_col = find_column(['usage_type', 'type', 'service', 'call_type', 'event', 'category'])
@@ -667,43 +684,72 @@ async def analyze_cdr(file: UploadFile = File(...), session: str = Cookie(defaul
 
         df['Duration_Formatted'] = df['Duration_Sec'].apply(format_duration)
 
-        # নিখুঁত তারিখ ও সময় পার্সিং (Fixing 1970-01-01 issue)
-        df['Full_DateTime'] = pd.NaT
-        
-        if dt_col and dt_col in df.columns:
-            if pd.api.types.is_numeric_dtype(df[dt_col]):
-                df['Full_DateTime'] = pd.to_datetime(df[dt_col], unit='d', origin='1899-12-30', errors='coerce')
+        # অপারেটরভেদে date-time parsing:
+        # Robi/Banglalink: 20260902143238 (YYYYMMDDHHMMSS)
+        # GP: START_DTTIME-এ একই 14-digit format
+        # Teletalk: 23/03/2026 18:12:31 (CSV UTF-8 BOM-সহও হতে পারে)
+        def parse_one_datetime(value):
+            if pd.isna(value):
+                return pd.NaT
+            if isinstance(value, (pd.Timestamp,)):
+                dt = pd.Timestamp(value)
             else:
-                dt_series = df[dt_col].astype(str).str.replace(r'\.0$', '', regex=True)
-                df['Full_DateTime'] = pd.to_datetime(dt_series, errors='coerce', dayfirst=True, format='mixed')
-        
-        if df['Full_DateTime'].isna().all() and date_col and date_col in df.columns:
-            if pd.api.types.is_numeric_dtype(df[date_col]):
-                df['Full_DateTime'] = pd.to_datetime(df[date_col], unit='d', origin='1899-12-30', errors='coerce')
-            else:
-                date_series = df[date_col].astype(str).str.replace(r'\.0$', '', regex=True)
-                if time_col and time_col in df.columns:
-                    time_series = df[time_col].astype(str).str.replace(r'\.0$', '', regex=True)
-                    combined = date_series + ' ' + time_series
-                    df['Full_DateTime'] = pd.to_datetime(combined, errors='coerce', dayfirst=True, format='mixed')
+                raw = str(value).strip()
+                if raw.lower() in ('', 'nan', 'nat', 'none', 'null'):
+                    return pd.NaT
+                raw = re.sub(r'\\.0$', '', raw)
+
+                if re.fullmatch(r'\\d{14}', raw):
+                    dt = pd.to_datetime(raw, format='%Y%m%d%H%M%S', errors='coerce')
+                elif re.fullmatch(r'\\d{8}', raw):
+                    dt = pd.to_datetime(raw, format='%Y%m%d', errors='coerce')
+                elif re.fullmatch(r'\\d{4,6}(?:\\.\\d+)?', raw):
+                    # Excel serial date কেবল স্বাভাবিক serial range-এ
+                    try:
+                        serial = float(raw)
+                        if 20000 <= serial <= 80000:
+                            dt = pd.to_datetime(serial, unit='D', origin='1899-12-30', errors='coerce')
+                        else:
+                            dt = pd.NaT
+                    except (ValueError, OverflowError):
+                        dt = pd.NaT
                 else:
-                    df['Full_DateTime'] = pd.to_datetime(date_series, errors='coerce', dayfirst=True, format='mixed')
+                    try:
+                        dt = pd.to_datetime(raw, errors='coerce', dayfirst=True, format='mixed')
+                    except (ValueError, TypeError):
+                        dt = pd.NaT
 
-        if df['Full_DateTime'].isna().all():
-            for col in df.columns:
-                try:
-                    parsed = pd.to_datetime(df[col], errors='coerce', dayfirst=True, format='mixed')
-                    if parsed.notna().sum() > len(df) * 0.3:
-                        df['Full_DateTime'] = parsed
-                        break
-                except:
-                    continue
+            if pd.isna(dt):
+                return pd.NaT
+            dt = pd.Timestamp(dt)
+            return dt if 2000 <= dt.year <= 2100 else pd.NaT
 
+        df['Full_DateTime'] = pd.NaT
+
+        if dt_col and dt_col in df.columns:
+            df['Full_DateTime'] = df[dt_col].apply(parse_one_datetime)
+
+        # পূর্ণ date-time কলাম না থাকলে date + time মিলিয়ে দেখা
+        if df['Full_DateTime'].isna().all() and date_col and date_col in df.columns:
+            if time_col and time_col in df.columns:
+                combined = (
+                    df[date_col].astype('string').fillna('').str.strip()
+                    + ' '
+                    + df[time_col].astype('string').fillna('').str.strip()
+                )
+                df['Full_DateTime'] = combined.apply(parse_one_datetime)
+            else:
+                df['Full_DateTime'] = df[date_col].apply(parse_one_datetime)
+
+        # fallback-এ অন্য কলাম থেকে তারিখ অনুমান করা হবে না:
+        # এতে নম্বর/IMEI ভুল করে 1970 সালের timestamp হয়ে যেত।
         raw_dates = df[date_col].astype(str).str.replace(r'\.0$', '', regex=True) if date_col and date_col in df.columns else pd.Series(['N/A']*len(df))
         raw_times = df[time_col].astype(str).str.replace(r'\.0$', '', regex=True) if time_col and time_col in df.columns else pd.Series(['N/A']*len(df))
 
         df['Call_Date'] = df['Full_DateTime'].dt.strftime('%Y-%m-%d').fillna(raw_dates)
         df['Call_Time'] = df['Full_DateTime'].dt.strftime('%H:%M:%S').fillna(raw_times)
+        df['Call_Date'] = df['Call_Date'].replace({'nan': '', 'NaT': 'N/A'})
+        df['Call_Time'] = df['Call_Time'].replace({'nan': '', 'NaT': 'N/A'})
 
         if type_col and type_col in df.columns:
             df['Type_Str'] = df[type_col].astype(str).str.upper()
@@ -740,8 +786,9 @@ async def analyze_cdr(file: UploadFile = File(...), session: str = Cookie(defaul
 
         total_duration_sec = int(df['Duration_Sec'].sum()) if 'Duration_Sec' in df.columns else 0
 
-        all_calls_details = valid_df.to_dict(orient='records')
-        night_calls_details = night_calls.to_dict(orient='records') if not night_calls.empty else []
+        # Full_DateTime internal calculation-এর জন্য; JSON response-এ string date/time-ই পাঠাব
+        all_calls_details = valid_df.drop(columns=['Full_DateTime'], errors='ignore').to_dict(orient='records')
+        night_calls_details = night_calls.drop(columns=['Full_DateTime'], errors='ignore').to_dict(orient='records') if not night_calls.empty else []
 
         return {
             "total_calls": int(len(valid_df)),
